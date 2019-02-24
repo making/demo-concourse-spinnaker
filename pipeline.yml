@@ -1,0 +1,270 @@
+groups: []
+
+resource_types:
+- name: spinnaker
+  type: registry-image
+  source:
+    repository: concourse/spinnaker-resource
+    tag: 0.0.1
+- name: slack-notification
+  type: registry-image
+  source:
+    repository: cfcommunity/slack-notification-resource
+    tag: latest
+
+resources:
+- name: slack-alert
+  type: slack-notification
+  source:
+    url: ((slack-hook-url))
+
+- name: hello-pks
+  type: git
+  source:
+    uri: https://github.com/making/hello-pks.git
+    branch: develop
+
+- name: jmeter
+  type: git
+  source:
+    uri: https://github.com/making/jmeter-on-concourse.git
+
+- name: dockerhub
+  type: docker-image
+  source:
+    repository: making/hello-pks
+    username: ((docker-username))
+    password: ((docker-password))
+- name: spinnaker-deploy
+  type: spinnaker
+  source:
+    spinnaker_api: ((spinnaker-api))
+    spinnaker_application: ((spinnaker-application))
+    spinnaker_pipeline: deploy-to-staging
+    spinnaker_x509_cert: ((spinnaker_x509_cert))
+    spinnaker_x509_key: ((spinnaker_x509_key))
+    status_check_timeout: 5m
+    statuses:
+    - SUCCEEDED
+  check_every: 10s
+- name: spinnaker-rollback
+  type: spinnaker
+  source:
+    spinnaker_api: ((spinnaker-api))
+    spinnaker_application: ((spinnaker-application))
+    spinnaker_pipeline: rollback-staging
+    spinnaker_x509_cert: ((spinnaker_x509_cert))
+    spinnaker_x509_key: ((spinnaker_x509_key))
+    status_check_timeout: 5m
+    statuses:
+    - SUCCEEDED
+  check_every: 10s
+# JMeter Report
+- name: report
+  type: cf
+  source:
+    api: ((cf-api))
+    username: ((cf-username))
+    password: ((cf-password))
+    organization: ((cf-org))
+    space: ((cf-space))
+    skip_cert_check: true
+jobs:
+# - name: unit
+#   plan:
+#   - get: repo
+#     resource: hello-pks
+#     trigger: true
+#   - task: mvn-test
+#     config:
+#       platform: linux
+#       image_resource:
+#         type: docker-image
+#         source:
+#           repository: maven
+#       inputs:
+#       - name: repo
+#       caches:
+#       - path: repo/m2   
+#       run:
+#         path: bash
+#         args:
+#         - -c
+#         - |
+#           set -e
+#           cd repo
+#           rm -rf ~/.m2
+#           ln -fs $(pwd)/m2 ~/.m2
+#           mvn test
+- name: build
+  plan:
+  - get: repo
+    resource: hello-pks
+    # passed:
+    # - unit
+    trigger: true
+  - task: build-image
+    config:
+      platform: linux
+      image_resource:
+        type: docker-image
+        source:
+          repository: maven
+      inputs:
+      - name: repo
+      outputs:
+      - name: build
+      caches:
+      - path: repo/m2   
+      run:
+        path: bash
+        args:
+        - -c
+        - |
+          set -e
+          cd repo
+          rm -rf ~/.m2
+          ln -fs $(pwd)/m2 ~/.m2
+          mvn package -DskipTests=true
+          cp Dockerfile ../build/
+          cp target/*.jar ../build/app.jar
+          ls -lah ../build
+  - put: dockerhub
+    params:
+      build: build
+      build_args:
+        JAR_FILE: app.jar
+- name: handoff-spinnaker
+  plan:
+  - get: repo
+    resource: hello-pks
+    passed:
+    - build
+    trigger: true
+  - get: dockerhub
+    passed:
+    - build
+    trigger: true
+  - task: create-artifact
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: ubuntu
+          tag: xenial
+      inputs:
+      - name: dockerhub
+      outputs:
+      - name: my-docker-artifact
+      - name: my-dynamic-param
+      run:
+        path: /bin/bash
+        args:
+        - -ec
+        - |2
+          set -e
+          DIGEST=`cat dockerhub/digest`
+          echo '[
+            {"type": "github/file","reference": "https://api.github.com/repos/making/hello-pks/contents/k8s/hello-pks.yml","name": "k8s/hello-pks.yml", "version": "develop"},
+            {"type": "docker/image","reference": "making/hello-pks@'${DIGEST}'","name": "making/hello-pks"}
+          ]' > my-docker-artifact/artifact.json
+          cat my-docker-artifact/artifact.json
+          echo '{"Date": "'$(date)'"}' > my-dynamic-param/params.json
+  - put: spinnaker-deploy
+    params:
+      trigger_params:
+        atc_url: $ATC_EXTERNAL_URL
+        build_id: $BUILD_ID
+        build_job_name: $BUILD_JOB_NAME
+      trigger_params_json_file: my-dynamic-param/params.json
+      artifacts_json_file: my-docker-artifact/artifact.json
+    on_success:
+      do:
+      - put: slack-alert
+        params:
+          channel: '#concourse'
+          text: |
+            <!here> :white_check_mark: *$BUILD_PIPELINE_NAME/$BUILD_JOB_NAME* succeeded with build <$ATC_EXTERNAL_URL/teams/$BUILD_TEAM_NAME/pipelines/$BUILD_PIPELINE_NAME/jobs/$BUILD_JOB_NAME/builds/$BUILD_NAME|$BUILD_NAME>!
+    on_failure:
+      do:
+      - put: slack-alert
+        params:
+          channel: '#concourse'
+          text: |
+            <!here> :rotating_light: *$BUILD_PIPELINE_NAME/$BUILD_JOB_NAME* failed with build <$ATC_EXTERNAL_URL/teams/$BUILD_TEAM_NAME/pipelines/$BUILD_PIPELINE_NAME/jobs/$BUILD_JOB_NAME/builds/$BUILD_NAME|$BUILD_NAME>!
+- name: run-acceptence
+  plan:
+  - aggregate:
+    - get: spinnaker-deploy
+      passed:
+      - handoff-spinnaker
+      trigger: true
+    - get: jmeter
+  - task: run-jmeter
+    params:
+      DOMAIN: hello-pks.k8s.bosh.tokyo
+      PORT: 443
+      PROTOCOL: https
+      LOOPS: 30
+      NUM_THREADS: 10
+      RAMP_TIME: 1
+    config:
+      platform: linux
+      image_resource:
+        type: registry-image
+        source:
+          repository: justb4/jmeter
+      inputs:
+      - name: jmeter
+      - name: spinnaker-deploy
+      outputs:
+      - name: report
+      run:
+        path: bash
+        args: 
+        - -c
+        - |
+          set -e
+          cd jmeter
+          jmeter -Dlog_level.jmeter=DEBUG \
+            -J DOMAIN=${DOMAIN} \
+            -J PORT=${PORT} \
+            -J PROTOCOL=${PROTOCOL} \
+            -J LOOPS=${LOOPS} \
+            -J NUM_THREADS=${NUM_THREADS} \
+            -J RAMP_TIME=${RAMP_TIME} \
+            -n -t test.jmx -l test.jtl -j jmeter.log \
+            -e -o ../report > result.txt
+          cat result.txt
+          grep "0 (0.00%)$" result.txt
+    on_success:
+      do:
+      - put: report
+        params:
+          manifest: jmeter/manifest.yml
+          path: report
+          current_app_name: demo-jemeter-report
+      - put: slack-alert
+        params:
+          channel: '#concourse'
+          text: |
+            <!here> :white_check_mark: *$BUILD_PIPELINE_NAME/$BUILD_JOB_NAME* succeeded with build <$ATC_EXTERNAL_URL/teams/$BUILD_TEAM_NAME/pipelines/$BUILD_PIPELINE_NAME/jobs/$BUILD_JOB_NAME/builds/$BUILD_NAME|$BUILD_NAME>!
+    on_failure:
+      do:
+      - put: report
+        params:
+          manifest: jmeter/manifest.yml
+          path: report
+          current_app_name: demo-jemeter-report
+      - put: slack-alert
+        params:
+          channel: '#concourse'
+          text: |
+            <!here> :rotating_light: *$BUILD_PIPELINE_NAME/$BUILD_JOB_NAME* failed with build <$ATC_EXTERNAL_URL/teams/$BUILD_TEAM_NAME/pipelines/$BUILD_PIPELINE_NAME/jobs/$BUILD_JOB_NAME/builds/$BUILD_NAME|$BUILD_NAME>!
+      - put: spinnaker-rollback
+        params:
+          trigger_params:
+            atc_url: $ATC_EXTERNAL_URL
+            build_id: $BUILD_ID
+            build_job_name: $BUILD_JOB_NAME
